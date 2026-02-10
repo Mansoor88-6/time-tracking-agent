@@ -42,20 +42,27 @@ func (db *DB) migrate() error {
 			version INTEGER PRIMARY KEY,
 			applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		)`,
-		`CREATE TABLE IF NOT EXISTS time_entries (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			user_id TEXT NOT NULL,
-			project_id TEXT,
-			description TEXT,
-			start_time TIMESTAMP NOT NULL,
-			end_time TIMESTAMP,
-			duration_seconds INTEGER,
-			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		// Device info table
+		`CREATE TABLE IF NOT EXISTS device_info (
+			id INTEGER PRIMARY KEY,
+			device_id TEXT UNIQUE NOT NULL,
+			device_name TEXT,
+			device_token TEXT,
+			registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			last_sync_at TIMESTAMP,
+			token_expires_at TIMESTAMP
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_time_entries_user_id ON time_entries(user_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_time_entries_project_id ON time_entries(project_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_time_entries_start_time ON time_entries(start_time)`,
+		// Pending events queue
+		`CREATE TABLE IF NOT EXISTS pending_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			event_data TEXT NOT NULL,
+			device_id TEXT NOT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			retry_count INTEGER DEFAULT 0,
+			last_attempt TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_events_device ON pending_events(device_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_pending_events_created ON pending_events(created_at)`,
 	}
 
 	for _, migration := range migrations {
