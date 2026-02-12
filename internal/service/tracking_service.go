@@ -1,6 +1,8 @@
 package service
 
 import (
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +24,7 @@ type TrackingService struct {
 	eventCollector  *collector.EventCollector
 	apiClient       *client.APIClient
 	eventQueue      *queue.EventQueue
+	urlStore        *URLStore // Optional: for extension-provided URLs
 	deviceID        string
 	logger          *zap.Logger
 	
@@ -43,6 +46,7 @@ func NewTrackingService(
 	eventCollector *collector.EventCollector,
 	apiClient *client.APIClient,
 	eventQueue *queue.EventQueue,
+	urlStore *URLStore, // Optional: can be nil if extension not available
 	deviceID string,
 	logger *zap.Logger,
 ) *TrackingService {
@@ -53,6 +57,7 @@ func NewTrackingService(
 		eventCollector: eventCollector,
 		apiClient:     apiClient,
 		eventQueue:    eventQueue,
+		urlStore:      urlStore,
 		deviceID:      deviceID,
 		logger:        logger,
 		stopChan:      make(chan struct{}),
@@ -208,6 +213,39 @@ func (ts *TrackingService) createEvent(window *platform.WindowInfo, state *track
 		if eventWindow.Title != "" {
 			event.Title = &eventWindow.Title
 		}
+
+		// Priority: Extension URL > Title-extracted URL > No URL
+		// Check URL store first (extension-provided URLs)
+		if eventWindow.Application != "" && ts.urlStore != nil {
+			if extensionURL, found := ts.urlStore.GetByApplicationAndTitle(eventWindow.Application, eventWindow.Title); found {
+				event.URL = &extensionURL
+				ts.logger.Info("Using extension-provided URL",
+					zap.String("url", extensionURL),
+					zap.String("application", eventWindow.Application),
+					zap.String("title", eventWindow.Title),
+				)
+			} else {
+				// Log when extension URL not found for debugging
+				ts.logger.Debug("Extension URL not found, trying title extraction",
+					zap.String("application", eventWindow.Application),
+					zap.String("title", eventWindow.Title),
+				)
+				// Fallback to title extraction
+				extractedURL := ts.extractDomainFromTitle(eventWindow.Title, eventWindow.Application)
+				if extractedURL != nil {
+					event.URL = extractedURL
+					ts.logger.Debug("Using title-extracted URL",
+						zap.String("url", *extractedURL),
+					)
+				}
+			}
+		} else if eventWindow.Application != "" {
+			// No URL store available, use title extraction
+			extractedURL := ts.extractDomainFromTitle(eventWindow.Title, eventWindow.Application)
+			if extractedURL != nil {
+				event.URL = extractedURL
+			}
+		}
 	}
 
 	ts.eventCollector.AddEvent(event)
@@ -329,4 +367,222 @@ func (ts *TrackingService) GetStatus() map[string]interface{} {
 		"pending_events": pendingCount,
 		"collector_pending": ts.eventCollector.GetPendingCount(),
 	}
+}
+
+// extractDomainFromTitle extracts the domain from browser window titles
+// Returns the domain as a URL (e.g., "https://youtube.com") or nil if not found
+func (ts *TrackingService) extractDomainFromTitle(title, application string) *string {
+	if title == "" || application == "" {
+		return nil
+	}
+
+	// Normalize application name to lowercase for comparison
+	appLower := strings.ToLower(application)
+
+	// Common browser names to detect
+	browsers := []string{
+		"chrome", "google chrome", "chromium",
+		"firefox", "mozilla firefox",
+		"edge", "microsoft edge",
+		"safari",
+		"opera",
+		"brave",
+		"vivaldi",
+		"tor browser",
+	}
+
+	// Check if application is a browser
+	isBrowser := false
+	for _, browser := range browsers {
+		if strings.Contains(appLower, browser) {
+			isBrowser = true
+			break
+		}
+	}
+
+	if !isBrowser {
+		return nil
+	}
+
+	// Try to extract domain from title
+	domain := ts.extractDomainFromTitleText(title)
+	if domain == "" {
+		return nil
+	}
+
+	// Return as URL
+	url := "https://" + domain
+	return &url
+}
+
+// extractDomainFromTitleText extracts domain from window title text
+// Handles various title formats like:
+// - "YouTube - Watch Videos" → "youtube.com"
+// - "YouTube - Google Chrome" → "youtube.com" (first part, ignore browser name)
+// - "Google - YouTube" → "youtube.com" (destination site)
+// - "GitHub - Microsoft/vscode" → "github.com"
+// - "Stack Overflow - Where Developers Learn" → "stackoverflow.com"
+func (ts *TrackingService) extractDomainFromTitleText(title string) string {
+	if title == "" {
+		return ""
+	}
+
+	titleLower := strings.ToLower(title)
+
+	// Browser names and search terms to exclude from matching
+	// (to avoid matching "google" in "Google Chrome" or "Google Search")
+	browserNames := []string{
+		"google chrome", "chrome", "chromium",
+		"mozilla firefox", "firefox",
+		"microsoft edge", "edge",
+		"safari", "opera", "brave", "vivaldi", "tor browser",
+		"google search", "search", // Exclude search terms
+	}
+
+	// First, try to find full URL pattern in title
+	urlRegex := regexp.MustCompile(`https?://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})`)
+	if matches := urlRegex.FindStringSubmatch(title); len(matches) > 1 {
+		domain := strings.ToLower(matches[1])
+		// Remove www. prefix
+		domain = strings.TrimPrefix(domain, "www.")
+		return domain
+	}
+
+	// Try to find domain pattern directly (domain.tld)
+	domainRegex := regexp.MustCompile(`([a-zA-Z0-9.-]+\.(com|org|net|io|co|edu|gov|uk|de|fr|jp|au|ca|in|br|ru|cn|es|it|nl|se|no|dk|fi|pl|cz|at|ch|be|ie|pt|gr|tr|za|mx|ar|cl|pe|ve|ec|uy|py|bo|cr|pa|do|gt|hn|ni|sv|bz|jm|tt|bb|gd|lc|vc|ag|dm|kn|ai|vg|ky|ms|tc|fk|gi|mt|cy|is|li|mc|ad|sm|va|lu|mo|hk|sg|my|th|ph|id|vn|kh|la|mm|bn|pk|bd|lk|np|af|ir|iq|sa|ae|kw|bh|qa|om|ye|jo|lb|sy|il|ps|eg|ly|tn|dz|ma|mr|sn|ml|bf|ne|td|sd|er|et|dj|so|ke|ug|rw|bi|tz|zm|mw|mz|ao|na|bw|sz|ls|mg|mu|sc|km|yt|re|io|sh|ac|gs|tf|aq|bv|hm|sj|um|as|gu|mp|pr|vi|fm|mh|pw|ck|nu|pn|tk|to|tv|vu|ws|nf|nr|ki|sb|pg|fj|nc|pf|wf|eh|ax|gg|je|im|fo|gl|pm|bl|mf|so|dev))`)
+	if matches := domainRegex.FindStringSubmatch(titleLower); len(matches) > 1 {
+		domain := strings.ToLower(matches[1])
+		// Remove www. prefix
+		domain = strings.TrimPrefix(domain, "www.")
+		return domain
+	}
+
+	// Pattern matching for common sites
+	// Note: "google" is intentionally excluded from general matching
+	// to avoid false matches in "Google Chrome" or "Google Search"
+	domainMap := map[string]string{
+		"youtube":          "youtube.com",
+		"github":           "github.com",
+		"stack overflow":   "stackoverflow.com",
+		"facebook":          "facebook.com",
+		"twitter":          "twitter.com",
+		"x.com":            "x.com",
+		"linkedin":         "linkedin.com",
+		"reddit":           "reddit.com",
+		"instagram":        "instagram.com",
+		"discord":          "discord.com",
+		"slack":            "slack.com",
+		"gmail":            "gmail.com",
+		"outlook":          "outlook.com",
+		"notion":           "notion.so",
+		"figma":            "figma.com",
+		"trello":           "trello.com",
+		"asana":            "asana.com",
+		"jira":             "jira.com",
+		"confluence":      "confluence.com",
+		"medium":           "medium.com",
+		"dev":              "dev.to",
+		"stack exchange":   "stackexchange.com",
+		"wikipedia":        "wikipedia.org",
+		"amazon":           "amazon.com",
+		"netflix":          "netflix.com",
+		"spotify":          "spotify.com",
+		"zoom":             "zoom.us",
+		"microsoft teams":  "teams.microsoft.com",
+		"google meet":      "meet.google.com",
+	}
+
+	// Helper to check if a string contains a browser name or search term
+	isBrowserOrSearchTerm := func(text string) bool {
+		for _, browser := range browserNames {
+			if strings.Contains(text, browser) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Helper to safely match "google" only when it's clearly a site (not browser/search)
+	// Only match "google" if it appears alone or with site indicators
+	matchGoogleSite := func(text string) string {
+		// Only match "google" if it's not part of "google chrome", "google search", etc.
+		textLower := strings.ToLower(text)
+		if strings.Contains(textLower, "google chrome") ||
+			strings.Contains(textLower, "google search") ||
+			strings.Contains(textLower, "chromium") {
+			return ""
+		}
+		// Match "google" only if it appears as a standalone word or with site context
+		if regexp.MustCompile(`\bgoogle\b`).MatchString(textLower) {
+			return "google.com"
+		}
+		return ""
+	}
+
+	// Split title by " - " to handle patterns like "Site - Browser" or "Site - Description"
+	parts := strings.Split(titleLower, " - ")
+	
+	// Priority 1: Check first part (site name) if it exists
+	if len(parts) > 0 && parts[0] != "" {
+		firstPart := strings.TrimSpace(parts[0])
+		// Remove leading numbers/parentheses like "(2) YouTube" → "youtube"
+		firstPart = regexp.MustCompile(`^[\(\d\)\s]+`).ReplaceAllString(firstPart, "")
+		firstPart = strings.TrimSpace(firstPart)
+		
+		// Check for "google" site (with special handling)
+		if googleDomain := matchGoogleSite(firstPart); googleDomain != "" {
+			return googleDomain
+		}
+		
+		// Check known sites
+		for key, domain := range domainMap {
+			if strings.Contains(firstPart, key) {
+				return domain
+			}
+		}
+	}
+
+	// Priority 2: Check second part only if it's NOT a browser/search term
+	// This handles cases like "Google - YouTube" where second part is the destination
+	if len(parts) > 1 && parts[1] != "" {
+		secondPart := strings.TrimSpace(parts[1])
+		// Skip if this part contains a browser name or search term
+		if !isBrowserOrSearchTerm(secondPart) {
+			// Check for "google" site (with special handling)
+			if googleDomain := matchGoogleSite(secondPart); googleDomain != "" {
+				return googleDomain
+			}
+			
+			// Check known sites
+			for key, domain := range domainMap {
+				if strings.Contains(secondPart, key) {
+					return domain
+				}
+			}
+		}
+	}
+
+	// Priority 3: Check entire title, but exclude browser names and search terms
+	// Create a cleaned version without browser names for matching
+	cleanedTitle := titleLower
+	for _, browser := range browserNames {
+		cleanedTitle = strings.ReplaceAll(cleanedTitle, browser, "")
+	}
+	
+	// Check for "google" site in cleaned title (with special handling)
+	if googleDomain := matchGoogleSite(cleanedTitle); googleDomain != "" {
+		return googleDomain
+	}
+	
+	// Check known sites in cleaned title
+	for key, domain := range domainMap {
+		// Only match if the key appears in the cleaned title
+		if strings.Contains(cleanedTitle, key) {
+			return domain
+		}
+	}
+
+	// If no match found, return empty string (don't guess)
+	// This is better than returning a wrong domain
+	return ""
 }

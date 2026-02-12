@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -18,6 +20,7 @@ import (
 	"Mansoor88-6/time-tracking-agent/internal/logger"
 	"Mansoor88-6/time-tracking-agent/internal/platform"
 	"Mansoor88-6/time-tracking-agent/internal/queue"
+	"Mansoor88-6/time-tracking-agent/internal/server"
 	"Mansoor88-6/time-tracking-agent/internal/service"
 	"Mansoor88-6/time-tracking-agent/internal/tracker"
 
@@ -138,6 +141,38 @@ func main() {
 	// Initialize event queue
 	eventQueue := queue.NewEventQueue(db.DB, log.Logger)
 
+	// Initialize URL store and server (for browser extension)
+	var urlStore *service.URLStore
+	var urlServer *server.URLServer
+	var urlHTTPServer *http.Server
+	
+	if cfg.Server.Enabled {
+		urlStore = service.NewURLStore(cfg.Server.URLStoreTTL, log.Logger)
+		urlServer = server.NewURLServer(urlStore, log.Logger)
+		
+		// Create HTTP server for URL updates
+		addr := fmt.Sprintf("localhost:%d", cfg.Server.Port)
+		urlHTTPServer = &http.Server{
+			Addr:         addr,
+			Handler:      urlServer,
+			ReadTimeout:  15 * time.Second,
+			WriteTimeout: 15 * time.Second,
+			IdleTimeout:  60 * time.Second,
+		}
+		
+		// Start URL server in goroutine
+		go func() {
+			log.Info("Starting URL server for browser extension",
+				zap.String("address", addr),
+			)
+			if err := urlHTTPServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Error("URL server error", zap.Error(err))
+			}
+		}()
+	} else {
+		log.Info("URL server disabled in configuration")
+	}
+
 	// Initialize window tracker
 	windowTracker := tracker.NewWindowTracker(
 		platformInstance,
@@ -168,6 +203,7 @@ func main() {
 		eventCollector,
 		apiClient,
 		eventQueue,
+		urlStore, // Can be nil if server disabled
 		deviceID,
 		log.Logger,
 	)
@@ -191,6 +227,22 @@ func main() {
 	log.Info("Received shutdown signal", zap.String("signal", sig.String()))
 
 	log.Info("Shutting down time-tracking agent...")
+
+	// Stop URL server if enabled
+	if urlHTTPServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := urlHTTPServer.Shutdown(ctx); err != nil {
+			log.Warn("URL server shutdown error", zap.Error(err))
+		} else {
+			log.Info("URL server stopped")
+		}
+	}
+
+	// Stop URL store if enabled
+	if urlStore != nil {
+		urlStore.Stop()
+	}
 
 	// Stop tracking service immediately (synchronous, with timeout)
 	done := make(chan struct{})
