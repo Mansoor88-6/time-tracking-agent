@@ -54,9 +54,7 @@ func main() {
 
 	// Initialize database
 	db, err := database.New(cfg.StoragePath, log.Logger)
-	if err != nil {
-		log.Fatal("Failed to initialize database", zap.Error(err))
-	}
+ 
 	defer func() {
 		if err := db.Close(); err != nil {
 			log.Error("Failed to close database", zap.Error(err))

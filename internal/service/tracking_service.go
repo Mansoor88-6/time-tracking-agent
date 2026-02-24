@@ -217,7 +217,23 @@ func (ts *TrackingService) createEvent(window *platform.WindowInfo, state *track
 		// Priority: Extension URL > Title-extracted URL > No URL
 		// Check URL store first (extension-provided URLs)
 		if eventWindow.Application != "" && ts.urlStore != nil {
-			if extensionURL, found := ts.urlStore.GetByApplicationAndTitle(eventWindow.Application, eventWindow.Title); found {
+			// Try immediate lookup first
+			extensionURL, found := ts.urlStore.GetByApplicationAndTitle(eventWindow.Application, eventWindow.Title)
+			
+			// If not found immediately, wait a short time for extension update to arrive
+			// This handles race conditions where window change happens before URL update
+			if !found {
+				// Wait up to 200ms for URL update (extension usually sends within 50-100ms)
+				for i := 0; i < 4; i++ {
+					time.Sleep(50 * time.Millisecond)
+					extensionURL, found = ts.urlStore.GetByApplicationAndTitle(eventWindow.Application, eventWindow.Title)
+					if found {
+						break
+					}
+				}
+			}
+			
+			if found {
 				event.URL = &extensionURL
 				ts.logger.Info("Using extension-provided URL",
 					zap.String("url", extensionURL),
@@ -226,7 +242,7 @@ func (ts *TrackingService) createEvent(window *platform.WindowInfo, state *track
 				)
 			} else {
 				// Log when extension URL not found for debugging
-				ts.logger.Debug("Extension URL not found, trying title extraction",
+				ts.logger.Debug("Extension URL not found after retry, trying title extraction",
 					zap.String("application", eventWindow.Application),
 					zap.String("title", eventWindow.Title),
 				)
@@ -252,11 +268,58 @@ func (ts *TrackingService) createEvent(window *platform.WindowInfo, state *track
 	ts.lastEventTime = now
 }
 
+// enrichEventsWithURLs enriches events with URLs from the URLStore
+// This is called right before sending to ensure events have the latest URLs
+// even if the URL update arrived after the event was created
+func (ts *TrackingService) enrichEventsWithURLs(events []models.TrackingEvent) {
+	if ts.urlStore == nil {
+		return
+	}
+
+	enrichedCount := 0
+	for i := range events {
+		event := &events[i]
+		
+		// Skip if event already has a URL
+		if event.URL != nil && *event.URL != "" {
+			continue
+		}
+		
+		// Only enrich events that have application and title (browser events)
+		if event.Application == nil || event.Title == nil {
+			continue
+		}
+		
+		// Try to get URL from store
+		url, found := ts.urlStore.GetByApplicationAndTitle(*event.Application, *event.Title)
+		if found {
+			event.URL = &url
+			enrichedCount++
+			ts.logger.Debug("Enriched event with URL before sending",
+				zap.String("url", url),
+				zap.String("application", *event.Application),
+				zap.String("title", *event.Title),
+			)
+		}
+	}
+	
+	if enrichedCount > 0 {
+		ts.logger.Info("Enriched events with URLs before sending",
+			zap.Int("enriched_count", enrichedCount),
+			zap.Int("total_events", len(events)),
+		)
+	}
+}
+
 // onBatchReady handles when a batch is ready to be sent
 func (ts *TrackingService) onBatchReady(events []models.TrackingEvent) {
 	if len(events) == 0 {
 		return
 	}
+
+	// Enrich events with URLs before sending
+	// This ensures URLs that arrived after event creation are still attached
+	ts.enrichEventsWithURLs(events)
 
 	ts.logger.Debug("Batch ready to send",
 		zap.Int("event_count", len(events)),

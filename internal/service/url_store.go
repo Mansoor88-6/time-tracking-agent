@@ -58,15 +58,45 @@ func (s *URLStore) Store(key string, url string) {
 }
 
 // StoreByApplicationAndTitle stores URL using application and title (normalizes application name)
+// Stores with multiple key variations to improve matching reliability
 func (s *URLStore) StoreByApplicationAndTitle(application, title, url string) {
-	key := s.makeKey(application, title)
-	s.logger.Debug("Storing URL with normalized key",
+	normalizedApp := s.normalizeApplicationName(application)
+	
+	// Store with original title
+	key1 := normalizedApp + ":" + title
+	s.Store(key1, url)
+	
+	// Store with normalized title (without browser suffix)
+	normalizedTitle := s.normalizeTitle(title)
+	if normalizedTitle != title {
+		key2 := normalizedApp + ":" + normalizedTitle
+		s.Store(key2, url)
+	}
+	
+	// Store with title variations (with and without browser suffix)
+	// This handles cases where extension sends "Page Title" but window tracker sees "Page Title - Google Chrome"
+	browserSuffixes := []string{
+		" - Google Chrome", " - Chrome",
+		" - Microsoft Edge", " - Edge",
+		" - Mozilla Firefox", " - Firefox",
+		" - Safari", " - Opera", " - Brave", " - Vivaldi",
+	}
+	
+	// If title doesn't have browser suffix, also store with common suffixes
+	if normalizedTitle == title {
+		for _, suffix := range browserSuffixes {
+			keyWithSuffix := normalizedApp + ":" + title + suffix
+			s.Store(keyWithSuffix, url)
+		}
+	}
+	
+	s.logger.Debug("Stored URL with multiple key variations",
 		zap.String("original_application", application),
-		zap.String("normalized_key", key),
-		zap.String("title", title),
+		zap.String("normalized_app", normalizedApp),
+		zap.String("original_title", title),
+		zap.String("normalized_title", normalizedTitle),
 		zap.String("url", url),
 	)
-	s.Store(key, url)
 }
 
 // Get retrieves a URL for a given key if it exists and hasn't expired
@@ -103,14 +133,29 @@ func (s *URLStore) GetByApplicationAndTitle(application, title string) (string, 
 		return url, true
 	}
 	
-	// Try fuzzy match - remove common browser suffixes from title
+	// Try normalized title match
+	normalizedTitle := s.normalizeTitle(title)
+	if normalizedTitle != title {
+		normalizedKey := normalizedApp + ":" + normalizedTitle
+		if url, found := s.Get(normalizedKey); found {
+			s.logger.Debug("URL lookup successful (normalized title match)",
+				zap.String("key", normalizedKey),
+				zap.String("url", url),
+			)
+			return url, true
+		}
+	}
+	
+	// Try fuzzy match - search all stored keys for a match
 	// Extension sends: "Page Title"
 	// Window tracker sees: "Page Title - Google Chrome"
-	fuzzyTitle := s.normalizeTitle(title)
-	
-	// Search all stored keys for a match
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	
+	// First, try to find the most recent matching URL (by timestamp)
+	var bestMatch *URLInfo
+	var bestMatchKey string
+	bestMatchTime := time.Time{}
 	
 	for key, info := range s.urls {
 		// Check if expired
@@ -118,23 +163,84 @@ func (s *URLStore) GetByApplicationAndTitle(application, title string) (string, 
 			continue
 		}
 		
-		// Check if key starts with normalizedApp: and title matches (fuzzy)
-		if strings.HasPrefix(key, normalizedApp+":") {
-			storedTitle := strings.TrimPrefix(key, normalizedApp+":")
-			normalizedStoredTitle := s.normalizeTitle(storedTitle)
-			
-			// Match if normalized titles are similar
-			if normalizedStoredTitle == fuzzyTitle || 
-			   strings.Contains(normalizedStoredTitle, fuzzyTitle) ||
-			   strings.Contains(fuzzyTitle, normalizedStoredTitle) {
-				s.logger.Debug("URL lookup successful (fuzzy match)",
-					zap.String("original_title", title),
-					zap.String("stored_title", storedTitle),
-					zap.String("matched_key", key),
-					zap.String("url", info.URL),
-				)
-				return info.URL, true
+		// Check if key starts with normalizedApp:
+		if !strings.HasPrefix(key, normalizedApp+":") {
+			continue
+		}
+		
+		storedTitle := strings.TrimPrefix(key, normalizedApp+":")
+		normalizedStoredTitle := s.normalizeTitle(storedTitle)
+		
+		// Match if normalized titles are similar
+		// Use more lenient matching: check if either contains the other
+		// or if they share significant common parts
+		titleMatch := false
+		if normalizedStoredTitle == normalizedTitle {
+			titleMatch = true
+		} else if strings.Contains(normalizedStoredTitle, normalizedTitle) || 
+		          strings.Contains(normalizedTitle, normalizedStoredTitle) {
+			// Check if the overlap is significant (at least 50% of shorter string)
+			shorter := normalizedTitle
+			longer := normalizedStoredTitle
+			if len(normalizedStoredTitle) < len(normalizedTitle) {
+				shorter = normalizedStoredTitle
+				longer = normalizedTitle
 			}
+			if len(shorter) > 0 && len(longer) >= len(shorter)/2 {
+				titleMatch = true
+			}
+		}
+		
+		if titleMatch {
+			// Prefer more recent matches
+			if info.Timestamp.After(bestMatchTime) {
+				bestMatch = info
+				bestMatchKey = key
+				bestMatchTime = info.Timestamp
+			}
+		}
+	}
+	
+	if bestMatch != nil {
+		s.logger.Debug("URL lookup successful (fuzzy match)",
+			zap.String("original_title", title),
+			zap.String("matched_key", bestMatchKey),
+			zap.String("url", bestMatch.URL),
+		)
+		return bestMatch.URL, true
+	}
+	
+	// Last resort: if we have a browser application and title is similar to any stored title
+	// This handles cases where title changes slightly but it's the same tab
+	// Only use this if we have very few stored URLs (likely single tab scenario)
+	if normalizedApp == "chrome" || normalizedApp == "firefox" || normalizedApp == "edge" {
+		appURLCount := 0
+		var recentURL *URLInfo
+		recentTime := time.Time{}
+		
+		for key, info := range s.urls {
+			if time.Since(info.Timestamp) > s.ttl {
+				continue
+			}
+			if strings.HasPrefix(key, normalizedApp+":") {
+				appURLCount++
+				// Only use if URL was updated very recently (within last 2 seconds)
+				// and it's the most recent one
+				if time.Since(info.Timestamp) < 2*time.Second && info.Timestamp.After(recentTime) {
+					recentURL = info
+					recentTime = info.Timestamp
+				}
+			}
+		}
+		
+		// Only use fallback if we have very few URLs (likely single tab) and very recent match
+		if recentURL != nil && appURLCount <= 3 {
+			s.logger.Debug("URL lookup successful (fallback to recent app URL)",
+				zap.String("application", application),
+				zap.String("url", recentURL.URL),
+				zap.Int("app_url_count", appURLCount),
+			)
+			return recentURL.URL, true
 		}
 	}
 	
@@ -142,7 +248,7 @@ func (s *URLStore) GetByApplicationAndTitle(application, title string) (string, 
 		zap.String("original_application", application),
 		zap.String("normalized_app", normalizedApp),
 		zap.String("original_title", title),
-		zap.String("normalized_title", fuzzyTitle),
+		zap.String("normalized_title", normalizedTitle),
 	)
 	
 	return "", false
