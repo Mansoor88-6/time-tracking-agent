@@ -9,16 +9,25 @@ import (
 	"go.uber.org/zap"
 )
 
-// WindowTracker monitors active window changes
+// AppFocusInfo represents application focus information (simplified from WindowInfo)
+type AppFocusInfo struct {
+	Application string
+	PID         int
+	Title       string
+	Timestamp   time.Time
+}
+
+// WindowTracker monitors active window changes (simplified to only track app focus)
 type WindowTracker struct {
-	platform      platform.Platform
-	pollInterval  time.Duration
-	currentWindow *platform.WindowInfo
-	onChange      func(*platform.WindowInfo)
-	logger        *zap.Logger
-	stopChan      chan struct{}
-	wg            sync.WaitGroup
-	mu            sync.RWMutex
+	platform        platform.Platform
+	pollInterval     time.Duration
+	currentAppFocus  *AppFocusInfo
+	onAppFocus       func(*AppFocusInfo)
+	logger           *zap.Logger
+	stopChan         chan struct{}
+	wg               sync.WaitGroup
+	mu               sync.RWMutex
+	sequenceCounter  int // Sequence counter for app focus events
 }
 
 // NewWindowTracker creates a new window tracker
@@ -31,9 +40,9 @@ func NewWindowTracker(platform platform.Platform, pollInterval time.Duration, lo
 	}
 }
 
-// Start begins monitoring window changes
-func (wt *WindowTracker) Start(onChange func(*platform.WindowInfo)) error {
-	wt.onChange = onChange
+// Start begins monitoring application focus changes
+func (wt *WindowTracker) Start(onAppFocus func(*AppFocusInfo)) error {
+	wt.onAppFocus = onAppFocus
 
 	wt.wg.Add(1)
 	go wt.pollLoop()
@@ -61,11 +70,16 @@ func (wt *WindowTracker) Stop() {
 	wt.logger.Info("Window tracker stopped")
 }
 
-// GetCurrentWindow returns the current active window
-func (wt *WindowTracker) GetCurrentWindow() *platform.WindowInfo {
+// GetCurrentAppFocus returns the current app focus info
+func (wt *WindowTracker) GetCurrentAppFocus() *AppFocusInfo {
 	wt.mu.RLock()
 	defer wt.mu.RUnlock()
-	return wt.currentWindow
+	if wt.currentAppFocus == nil {
+		return nil
+	}
+	// Return a copy
+	appFocus := *wt.currentAppFocus
+	return &appFocus
 }
 
 func (wt *WindowTracker) pollLoop() {
@@ -109,9 +123,15 @@ func (wt *WindowTracker) checkWindow() {
 	}
 
 	wt.mu.Lock()
-	hasChanged := wt.hasWindowChanged(window)
+	hasChanged := wt.hasAppFocusChanged(window)
 	if hasChanged {
-		wt.currentWindow = window
+		now := time.Now()
+		wt.currentAppFocus = &AppFocusInfo{
+			Application: window.Application,
+			PID:         window.ProcessID,
+			Title:       window.Title,
+			Timestamp:   now,
+		}
 		wt.mu.Unlock()
 
 		// Final check before calling callback
@@ -121,37 +141,69 @@ func (wt *WindowTracker) checkWindow() {
 		default:
 		}
 
-		wt.logger.Debug("Window changed",
+		wt.logger.Debug("App focus changed",
+			zap.String("application", window.Application),
+			zap.Int("pid", window.ProcessID),
+			zap.String("title", window.Title),
+			zap.String("title_length", string(rune(len(window.Title)))),
+		)
+		wt.logger.Info("AppFocusInfo created with title",
 			zap.String("application", window.Application),
 			zap.String("title", window.Title),
+			zap.Bool("title_empty", window.Title == ""),
 		)
 
-		if wt.onChange != nil {
-			wt.onChange(window)
+		if wt.onAppFocus != nil {
+			wt.onAppFocus(wt.currentAppFocus)
 		}
 	} else {
 		wt.mu.Unlock()
 	}
 }
 
-func (wt *WindowTracker) hasWindowChanged(newWindow *platform.WindowInfo) bool {
-	if wt.currentWindow == nil {
+func (wt *WindowTracker) hasAppFocusChanged(newWindow *platform.WindowInfo) bool {
+	if wt.currentAppFocus == nil {
+		wt.logger.Debug("App focus changed: no previous focus",
+			zap.String("new_application", newWindow.Application),
+			zap.Int("new_pid", newWindow.ProcessID),
+			zap.String("new_title", newWindow.Title),
+		)
 		return true
 	}
 
-	// Check if window changed (title, application, or process ID)
-	if wt.currentWindow.ProcessID != newWindow.ProcessID {
+	// Check if application or process ID changed
+	if wt.currentAppFocus.PID != newWindow.ProcessID {
+		wt.logger.Debug("App focus changed: pid changed",
+			zap.Int("old_pid", wt.currentAppFocus.PID),
+			zap.Int("new_pid", newWindow.ProcessID),
+			zap.String("application", newWindow.Application),
+		)
 		return true
 	}
-	if wt.currentWindow.Title != newWindow.Title {
-		return true
-	}
-	if wt.currentWindow.Application != newWindow.Application {
-		return true
-	}
-	if wt.currentWindow.IsVisible != newWindow.IsVisible {
+	if wt.currentAppFocus.Application != newWindow.Application {
+		wt.logger.Debug("App focus changed: application changed",
+			zap.String("old_application", wt.currentAppFocus.Application),
+			zap.String("new_application", newWindow.Application),
+			zap.Int("pid", newWindow.ProcessID),
+		)
 		return true
 	}
 
+	// Also treat title changes as focus changes so we get per-tab/file sessions
+	if wt.currentAppFocus.Title != newWindow.Title {
+		wt.logger.Debug("App focus changed: title changed",
+			zap.String("application", newWindow.Application),
+			zap.Int("pid", newWindow.ProcessID),
+			zap.String("old_title", wt.currentAppFocus.Title),
+			zap.String("new_title", newWindow.Title),
+		)
+		return true
+	}
+
+	wt.logger.Debug("App focus unchanged",
+		zap.String("application", newWindow.Application),
+		zap.Int("pid", newWindow.ProcessID),
+		zap.String("title", newWindow.Title),
+	)
 	return false
 }

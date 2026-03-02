@@ -139,37 +139,26 @@ func main() {
 	// Initialize event queue
 	eventQueue := queue.NewEventQueue(db.DB, log.Logger)
 
-	// Initialize URL store and server (for browser extension)
-	var urlStore *service.URLStore
-	var urlServer *server.URLServer
-	var urlHTTPServer *http.Server
+	// Initialize event collector
+	eventCollector := collector.NewEventCollector(
+		cfg.Tracking.BatchSize,
+		time.Duration(cfg.Tracking.BatchFlushInterval)*time.Second,
+		log.Logger,
+	)
+
+	// Create a callback variable that will be set after tracking service is created
+	var sessionEndCallback func(*service.ActiveSession)
 	
-	if cfg.Server.Enabled {
-		urlStore = service.NewURLStore(cfg.Server.URLStoreTTL, log.Logger)
-		urlServer = server.NewURLServer(urlStore, log.Logger)
-		
-		// Create HTTP server for URL updates
-		addr := fmt.Sprintf("localhost:%d", cfg.Server.Port)
-		urlHTTPServer = &http.Server{
-			Addr:         addr,
-			Handler:      urlServer,
-			ReadTimeout:  15 * time.Second,
-			WriteTimeout: 15 * time.Second,
-			IdleTimeout:  60 * time.Second,
-		}
-		
-		// Start URL server in goroutine
-		go func() {
-			log.Info("Starting URL server for browser extension",
-				zap.String("address", addr),
-			)
-			if err := urlHTTPServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Error("URL server error", zap.Error(err))
+	// Initialize session manager with temporary callback
+	sessionManager := service.NewSessionManager(
+		func(session *service.ActiveSession) {
+			if sessionEndCallback != nil {
+				sessionEndCallback(session)
 			}
-		}()
-	} else {
-		log.Info("URL server disabled in configuration")
-	}
+		},
+		log.Logger,
+		time.Duration(cfg.Tracking.SessionInactivityTimeout)*time.Second,
+	)
 
 	// Initialize window tracker
 	windowTracker := tracker.NewWindowTracker(
@@ -186,14 +175,7 @@ func main() {
 		log.Logger,
 	)
 
-	// Initialize event collector
-	eventCollector := collector.NewEventCollector(
-		cfg.Tracking.BatchSize,
-		time.Duration(cfg.Tracking.BatchFlushInterval)*time.Second,
-		log.Logger,
-	)
-
-	// Initialize tracking service
+	// Initialize tracking service with session manager
 	trackingService := service.NewTrackingService(
 		platformInstance,
 		windowTracker,
@@ -201,10 +183,42 @@ func main() {
 		eventCollector,
 		apiClient,
 		eventQueue,
-		urlStore, // Can be nil if server disabled
+		sessionManager,
 		deviceID,
 		log.Logger,
 	)
+
+	// Set up session manager callback to use tracking service's OnSessionEnd
+	sessionEndCallback = trackingService.OnSessionEnd
+
+	// Initialize browser event server (for browser extension)
+	var browserHTTPServer *http.Server
+	
+	if cfg.Server.Enabled {
+		browserEventServer := server.NewBrowserEventServer(sessionManager, log.Logger)
+		
+		// Create HTTP server for browser events
+		addr := fmt.Sprintf("localhost:%d", cfg.Server.Port)
+		browserHTTPServer = &http.Server{
+			Addr:         addr,
+			Handler:      browserEventServer,
+			ReadTimeout:  15 * time.Second,
+			WriteTimeout: 15 * time.Second,
+			IdleTimeout:  60 * time.Second,
+		}
+		
+		// Start browser event server in goroutine
+		go func() {
+			log.Info("Starting browser event server for extension",
+				zap.String("address", addr),
+			)
+			if err := browserHTTPServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Error("Browser event server error", zap.Error(err))
+			}
+		}()
+	} else {
+		log.Info("Browser event server disabled in configuration")
+	}
 
 	// Start tracking service
 	if err := trackingService.Start(); err != nil {
@@ -226,20 +240,15 @@ func main() {
 
 	log.Info("Shutting down time-tracking agent...")
 
-	// Stop URL server if enabled
-	if urlHTTPServer != nil {
+	// Stop browser event server if enabled
+	if browserHTTPServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		if err := urlHTTPServer.Shutdown(ctx); err != nil {
-			log.Warn("URL server shutdown error", zap.Error(err))
+		if err := browserHTTPServer.Shutdown(ctx); err != nil {
+			log.Warn("Browser event server shutdown error", zap.Error(err))
 		} else {
-			log.Info("URL server stopped")
+			log.Info("Browser event server stopped")
 		}
-	}
-
-	// Stop URL store if enabled
-	if urlStore != nil {
-		urlStore.Stop()
 	}
 
 	// Stop tracking service immediately (synchronous, with timeout)

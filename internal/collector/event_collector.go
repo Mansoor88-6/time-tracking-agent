@@ -96,16 +96,39 @@ func (ec *EventCollector) AddEvent(event models.TrackingEvent) {
 		copy(events, ec.events)
 		ec.events = ec.events[:0]
 	}
+	pendingCount := len(ec.events)
 	ec.mu.Unlock()
 
+	ec.logger.Info("Event added to collector",
+		zap.String("source", getEventSource(event)),
+		zap.String("application", getEventApplication(event)),
+		zap.Int("pending_count", pendingCount),
+		zap.Bool("will_flush", shouldFlush),
+	)
+
 	if shouldFlush {
-		ec.logger.Debug("Batch size reached, flushing events",
+		ec.logger.Info("Batch size reached, flushing events",
 			zap.Int("count", len(events)),
 		)
 		if ec.onBatchReady != nil {
 			ec.onBatchReady(events)
 		}
 	}
+}
+
+// Helper functions for logging
+func getEventSource(event models.TrackingEvent) string {
+	if event.Source != nil {
+		return *event.Source
+	}
+	return "unknown"
+}
+
+func getEventApplication(event models.TrackingEvent) string {
+	if event.Application != nil {
+		return *event.Application
+	}
+	return "unknown"
 }
 
 // Flush manually flushes all pending events
@@ -141,6 +164,19 @@ func (ec *EventCollector) autoFlushLoop() {
 	for {
 		select {
 		case <-ec.flushTicker.C:
+			ec.mu.Lock()
+			pendingCount := len(ec.events)
+			ec.mu.Unlock()
+			if pendingCount > 0 {
+				ec.logger.Info("Auto-flush triggered",
+					zap.Int("pending_count", pendingCount),
+					zap.Duration("flush_interval", ec.flushInterval),
+				)
+			} else {
+				ec.logger.Debug("Auto-flush triggered but no events pending",
+					zap.Duration("flush_interval", ec.flushInterval),
+				)
+			}
 			ec.Flush()
 		case <-ec.stopChan:
 			return

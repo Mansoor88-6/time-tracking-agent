@@ -1,8 +1,6 @@
 package service
 
 import (
-	"regexp"
-	"strings"
 	"sync"
 	"time"
 
@@ -24,15 +22,14 @@ type TrackingService struct {
 	eventCollector  *collector.EventCollector
 	apiClient       *client.APIClient
 	eventQueue      *queue.EventQueue
-	urlStore        *URLStore // Optional: for extension-provided URLs
+	sessionManager  *SessionManager
 	deviceID        string
 	logger          *zap.Logger
 	
-	currentWindow   *platform.WindowInfo
 	currentState     tracker.ActivityState
-	lastEventTime    time.Time
 	stopped          bool
 	mu               sync.RWMutex
+	appSequenceCounter int // Sequence counter for app focus events
 	
 	stopChan         chan struct{}
 	wg               sync.WaitGroup
@@ -46,7 +43,7 @@ func NewTrackingService(
 	eventCollector *collector.EventCollector,
 	apiClient *client.APIClient,
 	eventQueue *queue.EventQueue,
-	urlStore *URLStore, // Optional: can be nil if extension not available
+	sessionManager *SessionManager,
 	deviceID string,
 	logger *zap.Logger,
 ) *TrackingService {
@@ -57,7 +54,7 @@ func NewTrackingService(
 		eventCollector: eventCollector,
 		apiClient:     apiClient,
 		eventQueue:    eventQueue,
-		urlStore:      urlStore,
+		sessionManager: sessionManager,
 		deviceID:      deviceID,
 		logger:        logger,
 		stopChan:      make(chan struct{}),
@@ -69,8 +66,8 @@ func NewTrackingService(
 func (ts *TrackingService) Start() error {
 	ts.logger.Info("Starting tracking service", zap.String("device_id", ts.deviceID))
 
-	// Start window tracker
-	if err := ts.windowTracker.Start(ts.onWindowChange); err != nil {
+	// Start window tracker with app focus callback
+	if err := ts.windowTracker.Start(ts.onAppFocus); err != nil {
 		return err
 	}
 
@@ -107,6 +104,9 @@ func (ts *TrackingService) Stop() {
 	}
 	ts.mu.Unlock()
 	
+	// Stop session manager (will close current session)
+	ts.sessionManager.Stop()
+	
 	// Stop activity tracker FIRST (removes Windows hooks immediately)
 	ts.activityTracker.Stop()
 	
@@ -136,17 +136,35 @@ func (ts *TrackingService) Stop() {
 	ts.logger.Info("Tracking service stopped")
 }
 
-// onWindowChange handles window change events
-func (ts *TrackingService) onWindowChange(window *platform.WindowInfo) {
+// onAppFocus handles app focus change events from window tracker
+func (ts *TrackingService) onAppFocus(appFocus *tracker.AppFocusInfo) {
 	ts.mu.Lock()
-	ts.currentWindow = window
+	sequence := ts.appSequenceCounter
+	ts.appSequenceCounter++
 	ts.mu.Unlock()
 
-	// Window changes indicate user activity - reset activity timer
-	// This ensures tab/app switches are treated as activity
+	// App focus changes indicate user activity - reset activity timer
 	ts.activityTracker.RecordActivity()
 
-	ts.createEvent(window, nil)
+	// Create app focus event
+	appFocusEvent := &models.AppFocusEvent{
+		Type:        "APP_FOCUS",
+		Application: appFocus.Application,
+		PID:         appFocus.PID,
+		Title:       appFocus.Title,
+		Timestamp:   appFocus.Timestamp.UnixMilli(),
+		Sequence:    sequence,
+	}
+
+	ts.logger.Debug("Creating AppFocusEvent with title",
+		zap.String("application", appFocus.Application),
+		zap.String("title", appFocus.Title),
+		zap.Bool("title_empty", appFocus.Title == ""),
+		zap.Int("sequence", sequence),
+	)
+
+	// Process through session manager
+	ts.sessionManager.ProcessAppFocusEvent(appFocusEvent)
 }
 
 // onActivityStateChange handles activity state changes
@@ -156,172 +174,142 @@ func (ts *TrackingService) onActivityStateChange(state tracker.ActivityState) {
 	ts.currentState = state
 	ts.mu.Unlock()
 
+	// Activity state changes don't create sessions, they're metadata
+	// Sessions are created by app focus and browser events
 	if oldState != state {
-		ts.createEvent(nil, &state)
+		ts.logger.Debug("Activity state changed",
+			zap.String("old_state", string(oldState)),
+			zap.String("new_state", string(state)),
+		)
 	}
 }
 
-// createEvent creates a tracking event
-func (ts *TrackingService) createEvent(window *platform.WindowInfo, state *tracker.ActivityState) {
+// OnSessionEnd is called by SessionManager when a session ends
+// Converts ActiveSession to TrackingEvent and adds to collector
+func (ts *TrackingService) OnSessionEnd(session *ActiveSession) {
 	ts.mu.RLock()
 	stopped := ts.stopped
-	currentWindow := ts.currentWindow
-	currentState := ts.currentState
 	ts.mu.RUnlock()
 	
-	// Don't create events if we're shutting down
 	if stopped {
 		return
 	}
 
-	// Use provided state or current state
-	eventState := string(currentState)
-	if state != nil {
-		eventState = string(*state)
-	}
-
-	// Use provided window or current window
-	eventWindow := currentWindow
-	if window != nil {
-		eventWindow = window
-	}
-
-	now := time.Now()
-	timestamp := now.UnixMilli()
-
-	// Calculate duration since last event
-	var duration *int64
-	if !ts.lastEventTime.IsZero() {
-		dur := now.Sub(ts.lastEventTime).Milliseconds()
-		if dur > 0 {
-			duration = &dur
-		}
-	}
-
-	event := models.TrackingEvent{
-		DeviceID:  ts.deviceID,
-		Timestamp: timestamp,
-		Status:    eventState,
-		Duration:  duration,
-	}
-
-	// Add window information if available
-	if eventWindow != nil {
-		if eventWindow.Application != "" {
-			event.Application = &eventWindow.Application
-		}
-		if eventWindow.Title != "" {
-			event.Title = &eventWindow.Title
-		}
-
-		// Priority: Extension URL > Title-extracted URL > No URL
-		// Check URL store first (extension-provided URLs)
-		if eventWindow.Application != "" && ts.urlStore != nil {
-			// Try immediate lookup first
-			extensionURL, found := ts.urlStore.GetByApplicationAndTitle(eventWindow.Application, eventWindow.Title)
-			
-			// If not found immediately, wait a short time for extension update to arrive
-			// This handles race conditions where window change happens before URL update
-			if !found {
-				// Wait up to 200ms for URL update (extension usually sends within 50-100ms)
-				for i := 0; i < 4; i++ {
-					time.Sleep(50 * time.Millisecond)
-					extensionURL, found = ts.urlStore.GetByApplicationAndTitle(eventWindow.Application, eventWindow.Title)
-					if found {
-						break
-					}
-				}
-			}
-			
-			if found {
-				event.URL = &extensionURL
-				ts.logger.Info("Using extension-provided URL",
-					zap.String("url", extensionURL),
-					zap.String("application", eventWindow.Application),
-					zap.String("title", eventWindow.Title),
-				)
-			} else {
-				// Log when extension URL not found for debugging
-				ts.logger.Debug("Extension URL not found after retry, trying title extraction",
-					zap.String("application", eventWindow.Application),
-					zap.String("title", eventWindow.Title),
-				)
-				// Fallback to title extraction
-				extractedURL := ts.extractDomainFromTitle(eventWindow.Title, eventWindow.Application)
-				if extractedURL != nil {
-					event.URL = extractedURL
-					ts.logger.Debug("Using title-extracted URL",
-						zap.String("url", *extractedURL),
-					)
-				}
-			}
-		} else if eventWindow.Application != "" {
-			// No URL store available, use title extraction
-			extractedURL := ts.extractDomainFromTitle(eventWindow.Title, eventWindow.Application)
-			if extractedURL != nil {
-				event.URL = extractedURL
-			}
-		}
-	}
-
-	ts.eventCollector.AddEvent(event)
-	ts.lastEventTime = now
-}
-
-// enrichEventsWithURLs enriches events with URLs from the URLStore
-// This is called right before sending to ensure events have the latest URLs
-// even if the URL update arrived after the event was created
-func (ts *TrackingService) enrichEventsWithURLs(events []models.TrackingEvent) {
-	if ts.urlStore == nil {
+	// Calculate duration
+	duration := session.LastEventTime.Sub(session.StartTime).Milliseconds()
+	
+	// Apply minimum duration threshold (500ms) to avoid skipping very short but valid sessions
+	// This handles cases where app switching happens very quickly
+	const minDurationMs int64 = 500
+	if duration <= 0 {
+		// Skip sessions with zero or negative duration
+		ts.logger.Debug("Skipping session with zero or negative duration",
+			zap.String("source", session.Source),
+			zap.String("application", session.Application),
+			zap.Int64("duration_ms", duration),
+		)
 		return
 	}
+	
+	// Apply minimum duration for very short sessions
+	if duration < minDurationMs {
+		ts.logger.Debug("Applying minimum duration threshold",
+			zap.String("source", session.Source),
+			zap.String("application", session.Application),
+			zap.Int64("original_duration_ms", duration),
+			zap.Int64("adjusted_duration_ms", minDurationMs),
+		)
+		duration = minDurationMs
+	}
 
-	enrichedCount := 0
-	for i := range events {
-		event := &events[i]
-		
-		// Skip if event already has a URL
-		if event.URL != nil && *event.URL != "" {
-			continue
+	// Create tracking event from session
+	event := models.TrackingEvent{
+		DeviceID:  ts.deviceID,
+		Timestamp: session.StartTime.UnixMilli(),
+		Status:    string(tracker.StateActive), // Sessions are always "active"
+		Duration:  &duration,
+	}
+
+	// Set source
+	source := session.Source
+	event.Source = &source
+
+	// Set application
+	if session.Application != "" {
+		event.Application = &session.Application
 		}
-		
-		// Only enrich events that have application and title (browser events)
-		if event.Application == nil || event.Title == nil {
-			continue
+
+	// Set browser-specific fields
+	if session.Source == "browser" {
+		if session.URL != "" {
+			event.URL = &session.URL
 		}
-		
-		// Try to get URL from store
-		url, found := ts.urlStore.GetByApplicationAndTitle(*event.Application, *event.Title)
-		if found {
-			event.URL = &url
-			enrichedCount++
-			ts.logger.Debug("Enriched event with URL before sending",
-				zap.String("url", url),
-				zap.String("application", *event.Application),
-				zap.String("title", *event.Title),
+		if session.Title != "" {
+			event.Title = &session.Title
+		}
+		if session.TabID > 0 {
+			event.TabID = &session.TabID
+		}
+		if session.WindowID > 0 {
+			event.WindowID = &session.WindowID
+		}
+	} else if session.Source == "app" {
+		// Set app-specific fields (including title)
+		if session.Title != "" {
+			event.Title = &session.Title
+			ts.logger.Debug("Setting title for app event",
+				zap.String("application", session.Application),
+				zap.String("title", session.Title),
+				zap.Int("title_length", len(session.Title)),
+				)
+			} else {
+			ts.logger.Debug("App session has empty title, not setting event title",
+				zap.String("application", session.Application),
 			)
 		}
 	}
-	
-	if enrichedCount > 0 {
-		ts.logger.Info("Enriched events with URLs before sending",
-			zap.Int("enriched_count", enrichedCount),
-			zap.Int("total_events", len(events)),
-		)
+
+	// Set sequence
+	event.Sequence = &session.Sequence
+
+	// Set start and end times
+	startTime := session.StartTime.UnixMilli()
+	endTime := session.LastEventTime.UnixMilli()
+	event.StartTime = &startTime
+	event.EndTime = &endTime
+
+	eventTitleValue := "<nil>"
+	if event.Title != nil {
+		eventTitleValue = *event.Title
 	}
+	ts.logger.Info("Session ended, creating event",
+		zap.String("source", session.Source),
+		zap.String("application", session.Application),
+		zap.String("url", session.URL),
+		zap.String("session_title", session.Title),
+		zap.Bool("title_set", event.Title != nil),
+		zap.String("event_title", eventTitleValue),
+		zap.Int64("duration_ms", duration),
+		zap.Time("start_time", session.StartTime),
+		zap.Time("end_time", session.LastEventTime),
+	)
+
+	// Add to event collector
+	ts.eventCollector.AddEvent(event)
+	ts.logger.Debug("Event added to collector",
+		zap.String("source", session.Source),
+		zap.String("application", session.Application),
+	)
 }
 
 // onBatchReady handles when a batch is ready to be sent
 func (ts *TrackingService) onBatchReady(events []models.TrackingEvent) {
 	if len(events) == 0 {
+		ts.logger.Debug("Batch ready but empty, skipping")
 		return
 	}
 
-	// Enrich events with URLs before sending
-	// This ensures URLs that arrived after event creation are still attached
-	ts.enrichEventsWithURLs(events)
-
-	ts.logger.Debug("Batch ready to send",
+	ts.logger.Info("Batch ready to send",
 		zap.Int("event_count", len(events)),
 	)
 
@@ -424,228 +412,21 @@ func (ts *TrackingService) GetStatus() map[string]interface{} {
 
 	pendingCount, _ := ts.eventQueue.GetPendingCount(ts.deviceID)
 
+	currentSession := ts.sessionManager.GetCurrentSession()
+	sessionInfo := map[string]interface{}{}
+	if currentSession != nil {
+		sessionInfo["source"] = currentSession.Source
+		sessionInfo["application"] = currentSession.Application
+		if currentSession.Source == "browser" {
+			sessionInfo["url"] = currentSession.URL
+		}
+	}
+
 	return map[string]interface{}{
 		"device_id":      ts.deviceID,
 		"current_state":  string(ts.currentState),
 		"pending_events": pendingCount,
 		"collector_pending": ts.eventCollector.GetPendingCount(),
+		"current_session": sessionInfo,
 	}
-}
-
-// extractDomainFromTitle extracts the domain from browser window titles
-// Returns the domain as a URL (e.g., "https://youtube.com") or nil if not found
-func (ts *TrackingService) extractDomainFromTitle(title, application string) *string {
-	if title == "" || application == "" {
-		return nil
-	}
-
-	// Normalize application name to lowercase for comparison
-	appLower := strings.ToLower(application)
-
-	// Common browser names to detect
-	browsers := []string{
-		"chrome", "google chrome", "chromium",
-		"firefox", "mozilla firefox",
-		"edge", "microsoft edge",
-		"safari",
-		"opera",
-		"brave",
-		"vivaldi",
-		"tor browser",
-	}
-
-	// Check if application is a browser
-	isBrowser := false
-	for _, browser := range browsers {
-		if strings.Contains(appLower, browser) {
-			isBrowser = true
-			break
-		}
-	}
-
-	if !isBrowser {
-		return nil
-	}
-
-	// Try to extract domain from title
-	domain := ts.extractDomainFromTitleText(title)
-	if domain == "" {
-		return nil
-	}
-
-	// Return as URL
-	url := "https://" + domain
-	return &url
-}
-
-// extractDomainFromTitleText extracts domain from window title text
-// Handles various title formats like:
-// - "YouTube - Watch Videos" → "youtube.com"
-// - "YouTube - Google Chrome" → "youtube.com" (first part, ignore browser name)
-// - "Google - YouTube" → "youtube.com" (destination site)
-// - "GitHub - Microsoft/vscode" → "github.com"
-// - "Stack Overflow - Where Developers Learn" → "stackoverflow.com"
-func (ts *TrackingService) extractDomainFromTitleText(title string) string {
-	if title == "" {
-		return ""
-	}
-
-	titleLower := strings.ToLower(title)
-
-	// Browser names and search terms to exclude from matching
-	// (to avoid matching "google" in "Google Chrome" or "Google Search")
-	browserNames := []string{
-		"google chrome", "chrome", "chromium",
-		"mozilla firefox", "firefox",
-		"microsoft edge", "edge",
-		"safari", "opera", "brave", "vivaldi", "tor browser",
-		"google search", "search", // Exclude search terms
-	}
-
-	// First, try to find full URL pattern in title
-	urlRegex := regexp.MustCompile(`https?://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})`)
-	if matches := urlRegex.FindStringSubmatch(title); len(matches) > 1 {
-		domain := strings.ToLower(matches[1])
-		// Remove www. prefix
-		domain = strings.TrimPrefix(domain, "www.")
-		return domain
-	}
-
-	// Try to find domain pattern directly (domain.tld)
-	domainRegex := regexp.MustCompile(`([a-zA-Z0-9.-]+\.(com|org|net|io|co|edu|gov|uk|de|fr|jp|au|ca|in|br|ru|cn|es|it|nl|se|no|dk|fi|pl|cz|at|ch|be|ie|pt|gr|tr|za|mx|ar|cl|pe|ve|ec|uy|py|bo|cr|pa|do|gt|hn|ni|sv|bz|jm|tt|bb|gd|lc|vc|ag|dm|kn|ai|vg|ky|ms|tc|fk|gi|mt|cy|is|li|mc|ad|sm|va|lu|mo|hk|sg|my|th|ph|id|vn|kh|la|mm|bn|pk|bd|lk|np|af|ir|iq|sa|ae|kw|bh|qa|om|ye|jo|lb|sy|il|ps|eg|ly|tn|dz|ma|mr|sn|ml|bf|ne|td|sd|er|et|dj|so|ke|ug|rw|bi|tz|zm|mw|mz|ao|na|bw|sz|ls|mg|mu|sc|km|yt|re|io|sh|ac|gs|tf|aq|bv|hm|sj|um|as|gu|mp|pr|vi|fm|mh|pw|ck|nu|pn|tk|to|tv|vu|ws|nf|nr|ki|sb|pg|fj|nc|pf|wf|eh|ax|gg|je|im|fo|gl|pm|bl|mf|so|dev))`)
-	if matches := domainRegex.FindStringSubmatch(titleLower); len(matches) > 1 {
-		domain := strings.ToLower(matches[1])
-		// Remove www. prefix
-		domain = strings.TrimPrefix(domain, "www.")
-		return domain
-	}
-
-	// Pattern matching for common sites
-	// Note: "google" is intentionally excluded from general matching
-	// to avoid false matches in "Google Chrome" or "Google Search"
-	domainMap := map[string]string{
-		"youtube":          "youtube.com",
-		"github":           "github.com",
-		"stack overflow":   "stackoverflow.com",
-		"facebook":          "facebook.com",
-		"twitter":          "twitter.com",
-		"x.com":            "x.com",
-		"linkedin":         "linkedin.com",
-		"reddit":           "reddit.com",
-		"instagram":        "instagram.com",
-		"discord":          "discord.com",
-		"slack":            "slack.com",
-		"gmail":            "gmail.com",
-		"outlook":          "outlook.com",
-		"notion":           "notion.so",
-		"figma":            "figma.com",
-		"trello":           "trello.com",
-		"asana":            "asana.com",
-		"jira":             "jira.com",
-		"confluence":      "confluence.com",
-		"medium":           "medium.com",
-		"dev":              "dev.to",
-		"stack exchange":   "stackexchange.com",
-		"wikipedia":        "wikipedia.org",
-		"amazon":           "amazon.com",
-		"netflix":          "netflix.com",
-		"spotify":          "spotify.com",
-		"zoom":             "zoom.us",
-		"microsoft teams":  "teams.microsoft.com",
-		"google meet":      "meet.google.com",
-	}
-
-	// Helper to check if a string contains a browser name or search term
-	isBrowserOrSearchTerm := func(text string) bool {
-		for _, browser := range browserNames {
-			if strings.Contains(text, browser) {
-				return true
-			}
-		}
-		return false
-	}
-
-	// Helper to safely match "google" only when it's clearly a site (not browser/search)
-	// Only match "google" if it appears alone or with site indicators
-	matchGoogleSite := func(text string) string {
-		// Only match "google" if it's not part of "google chrome", "google search", etc.
-		textLower := strings.ToLower(text)
-		if strings.Contains(textLower, "google chrome") ||
-			strings.Contains(textLower, "google search") ||
-			strings.Contains(textLower, "chromium") {
-			return ""
-		}
-		// Match "google" only if it appears as a standalone word or with site context
-		if regexp.MustCompile(`\bgoogle\b`).MatchString(textLower) {
-			return "google.com"
-		}
-		return ""
-	}
-
-	// Split title by " - " to handle patterns like "Site - Browser" or "Site - Description"
-	parts := strings.Split(titleLower, " - ")
-	
-	// Priority 1: Check first part (site name) if it exists
-	if len(parts) > 0 && parts[0] != "" {
-		firstPart := strings.TrimSpace(parts[0])
-		// Remove leading numbers/parentheses like "(2) YouTube" → "youtube"
-		firstPart = regexp.MustCompile(`^[\(\d\)\s]+`).ReplaceAllString(firstPart, "")
-		firstPart = strings.TrimSpace(firstPart)
-		
-		// Check for "google" site (with special handling)
-		if googleDomain := matchGoogleSite(firstPart); googleDomain != "" {
-			return googleDomain
-		}
-		
-		// Check known sites
-		for key, domain := range domainMap {
-			if strings.Contains(firstPart, key) {
-				return domain
-			}
-		}
-	}
-
-	// Priority 2: Check second part only if it's NOT a browser/search term
-	// This handles cases like "Google - YouTube" where second part is the destination
-	if len(parts) > 1 && parts[1] != "" {
-		secondPart := strings.TrimSpace(parts[1])
-		// Skip if this part contains a browser name or search term
-		if !isBrowserOrSearchTerm(secondPart) {
-			// Check for "google" site (with special handling)
-			if googleDomain := matchGoogleSite(secondPart); googleDomain != "" {
-				return googleDomain
-			}
-			
-			// Check known sites
-			for key, domain := range domainMap {
-				if strings.Contains(secondPart, key) {
-					return domain
-				}
-			}
-		}
-	}
-
-	// Priority 3: Check entire title, but exclude browser names and search terms
-	// Create a cleaned version without browser names for matching
-	cleanedTitle := titleLower
-	for _, browser := range browserNames {
-		cleanedTitle = strings.ReplaceAll(cleanedTitle, browser, "")
-	}
-	
-	// Check for "google" site in cleaned title (with special handling)
-	if googleDomain := matchGoogleSite(cleanedTitle); googleDomain != "" {
-		return googleDomain
-	}
-	
-	// Check known sites in cleaned title
-	for key, domain := range domainMap {
-		// Only match if the key appears in the cleaned title
-		if strings.Contains(cleanedTitle, key) {
-			return domain
-		}
-	}
-
-	// If no match found, return empty string (don't guess)
-	// This is better than returning a wrong domain
-	return ""
 }
