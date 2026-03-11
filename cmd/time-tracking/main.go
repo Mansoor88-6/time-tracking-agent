@@ -4,9 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -23,24 +25,38 @@ import (
 	"Mansoor88-6/time-tracking-agent/internal/server"
 	"Mansoor88-6/time-tracking-agent/internal/service"
 	"Mansoor88-6/time-tracking-agent/internal/tracker"
+	"Mansoor88-6/time-tracking-agent/internal/ui"
 
 	"go.uber.org/zap"
 )
 
+// Version is set by the build system via -ldflags
+var Version = "dev"
+
 func main() {
 	// Parse command line flags
-	configPath := flag.String("config", "config/local.yaml", "Path to configuration file")
+	configPath := flag.String("config", "", "Path to configuration file (auto-detected if empty)")
 	flag.Parse()
 
+	// Resolve config path (auto-detect if not specified)
+	resolvedConfigPath, err := config.ResolveConfigPath(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to find config: %v\n", err)
+		os.Exit(1)
+	}
+
 	// Load configuration
-	cfg, err := config.LoadConfig(*configPath)
+	cfg, err := config.LoadConfig(resolvedConfigPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Initialize logger
-	log, err := logger.New(cfg.Log.Level, cfg.Log.Format)
+	// Determine logs path relative to base dir (needed early for file logger)
+	logsPath := filepath.Join(cfg.BaseDir, "logs")
+
+	// Initialize logger with file output for production
+	log, err := logger.NewWithFile(cfg.Log.Level, cfg.Log.Format, logsPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
 		os.Exit(1)
@@ -48,13 +64,18 @@ func main() {
 	defer log.Sync()
 
 	log.Info("Starting time-tracking agent",
+		zap.String("version", Version),
 		zap.String("env", cfg.Env),
-		zap.String("config_path", *configPath),
+		zap.String("config_path", resolvedConfigPath),
+		zap.String("base_dir", cfg.BaseDir),
+		zap.String("logs_path", logsPath),
 	)
 
 	// Initialize database
 	db, err := database.New(cfg.StoragePath, log.Logger)
- 
+	if err != nil {
+		log.Fatal("Failed to initialize database", zap.Error(err))
+	}
 	defer func() {
 		if err := db.Close(); err != nil {
 			log.Error("Failed to close database", zap.Error(err))
@@ -74,9 +95,15 @@ func main() {
 		log.Fatal("Failed to get device ID", zap.Error(err))
 	}
 
+	// Save generated device ID back to config so it persists across restarts
 	if cfg.Device.ID == "" {
 		log.Info("Generated device ID", zap.String("device_id", deviceID))
-		// Note: In a production app, you'd want to save this back to config
+		cfg.Device.ID = deviceID
+		if err := saveConfigField(resolvedConfigPath, "id:", fmt.Sprintf("  id: \"%s\"", deviceID)); err != nil {
+			log.Warn("Failed to save device ID to config", zap.Error(err))
+		} else {
+			log.Info("Device ID saved to config")
+		}
 	} else {
 		log.Info("Using configured device ID", zap.String("device_id", deviceID))
 	}
@@ -94,10 +121,24 @@ func main() {
 			log.Logger,
 		)
 
-		// Perform authorization
-		code, err := deviceAuth.AuthorizeDevice(deviceID, cfg.Device.Name)
+		// Retry authorization up to 3 times (user may close the browser, etc.)
+		var code string
+		for attempt := 1; attempt <= 3; attempt++ {
+			code, err = deviceAuth.AuthorizeDevice(deviceID, cfg.Device.Name)
+			if err == nil {
+				break
+			}
+			log.Warn("Device authorization attempt failed",
+				zap.Int("attempt", attempt),
+				zap.Error(err),
+			)
+			if attempt < 3 {
+				log.Info("Retrying authorization in 5 seconds...")
+				time.Sleep(5 * time.Second)
+			}
+		}
 		if err != nil {
-			log.Fatal("Device authorization failed", zap.Error(err))
+			log.Fatal("Device authorization failed after all retries", zap.Error(err))
 		}
 
 		// Exchange code for token
@@ -114,7 +155,7 @@ func main() {
 
 		// Save token to config file
 		cfg.Auth.DeviceToken = deviceToken
-		if err := saveConfig(*configPath, cfg); err != nil {
+		if err := saveConfig(resolvedConfigPath, cfg); err != nil {
 			log.Warn("Failed to save device token to config", zap.Error(err))
 		} else {
 			log.Info("Device token saved to config")
@@ -148,7 +189,7 @@ func main() {
 
 	// Create a callback variable that will be set after tracking service is created
 	var sessionEndCallback func(*service.ActiveSession)
-	
+
 	// Initialize session manager with temporary callback
 	sessionManager := service.NewSessionManager(
 		func(session *service.ActiveSession) {
@@ -193,29 +234,41 @@ func main() {
 
 	// Initialize browser event server (for browser extension)
 	var browserHTTPServer *http.Server
-	
+
 	if cfg.Server.Enabled {
 		browserEventServer := server.NewBrowserEventServer(sessionManager, log.Logger)
-		
-		// Create HTTP server for browser events
-		addr := fmt.Sprintf("localhost:%d", cfg.Server.Port)
-		browserHTTPServer = &http.Server{
-			Addr:         addr,
-			Handler:      browserEventServer,
-			ReadTimeout:  15 * time.Second,
-			WriteTimeout: 15 * time.Second,
-			IdleTimeout:  60 * time.Second,
-		}
-		
-		// Start browser event server in goroutine
-		go func() {
-			log.Info("Starting browser event server for extension",
-				zap.String("address", addr),
-			)
-			if err := browserHTTPServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Error("Browser event server error", zap.Error(err))
+
+		// Try the configured port; if busy, try nearby ports
+		browserListener, browserPort, err := listenWithFallback(cfg.Server.Port, log)
+		if err != nil {
+			log.Error("Failed to start browser event server on any port", zap.Error(err))
+		} else {
+			browserHTTPServer = &http.Server{
+				Handler:      browserEventServer,
+				ReadTimeout:  15 * time.Second,
+				WriteTimeout: 15 * time.Second,
+				IdleTimeout:  60 * time.Second,
 			}
-		}()
+
+			// Start browser event server in goroutine
+			go func() {
+				log.Info("Browser event server started for extension",
+					zap.Int("configured_port", cfg.Server.Port),
+					zap.Int("actual_port", browserPort),
+				)
+				if err := browserHTTPServer.Serve(browserListener); err != nil && err != http.ErrServerClosed {
+					log.Error("Browser event server error", zap.Error(err))
+				}
+			}()
+
+			if browserPort != cfg.Server.Port {
+				log.Warn("Browser extension server is on a different port than configured!",
+					zap.Int("configured", cfg.Server.Port),
+					zap.Int("actual", browserPort),
+					zap.String("note", "Make sure the browser extension is configured to use the correct port"),
+				)
+			}
+		}
 	} else {
 		log.Info("Browser event server disabled in configuration")
 	}
@@ -225,18 +278,44 @@ func main() {
 		log.Fatal("Failed to start tracking service", zap.Error(err))
 	}
 
+	// Create and start tray manager (Windows only)
+	var trayQuitChan chan struct{}
+	trayManager := ui.NewTrayManager(
+		log.Logger,
+		sessionManager,
+		trackingService,
+		cfg.Backend.BaseURL,
+		logsPath,
+	)
+
+	// Start tray in background (on Windows)
+	trayCtx, trayCancel := context.WithCancel(context.Background())
+	trayQuitChan = make(chan struct{})
+	go func() {
+		defer close(trayQuitChan)
+		if err := trayManager.Start(trayCtx); err != nil {
+			log.Warn("Tray manager error", zap.Error(err))
+		}
+	}()
+
 	log.Info("Time-tracking agent started successfully",
+		zap.String("version", Version),
 		zap.String("device_id", deviceID),
 		zap.String("backend_url", cfg.Backend.BaseURL),
 	)
 
-	// Wait for interrupt signal to gracefully shutdown
+	// Wait for interrupt signal or tray quit
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	
-	// Wait for signal
-	sig := <-quit
-	log.Info("Received shutdown signal", zap.String("signal", sig.String()))
+
+	// Wait for signal or tray quit
+	select {
+	case sig := <-quit:
+		log.Info("Received shutdown signal", zap.String("signal", sig.String()))
+	case <-trayQuitChan:
+		log.Info("Received quit from tray menu")
+		trayCancel()
+	}
 
 	log.Info("Shutting down time-tracking agent...")
 
@@ -264,7 +343,6 @@ func main() {
 		log.Info("Tracking service stopped successfully")
 	case <-time.After(3 * time.Second):
 		log.Warn("Shutdown timeout reached, forcing immediate exit")
-		// Force exit immediately if graceful shutdown fails
 		os.Exit(1)
 	}
 
@@ -276,53 +354,73 @@ func main() {
 	}()
 
 	log.Info("Time-tracking agent stopped")
-	
+
 	// Force exit immediately to ensure process terminates
 	// Windows hooks can prevent normal exit, so we must force it
 	os.Exit(0)
 }
 
-// saveConfig saves the configuration back to the YAML file
-// Note: This is a simple implementation. In production, you might want to use
-// a proper YAML library or update cleanenv to support writing configs.
+// listenWithFallback tries to bind to the preferred port, then nearby ports,
+// then lets the OS pick a free port. Returns the listener and actual port.
+func listenWithFallback(preferredPort int, log *logger.Logger) (net.Listener, int, error) {
+	// Try preferred port
+	addr := fmt.Sprintf("localhost:%d", preferredPort)
+	listener, err := net.Listen("tcp", addr)
+	if err == nil {
+		return listener, preferredPort, nil
+	}
+	log.Warn("Preferred browser server port unavailable",
+		zap.Int("port", preferredPort),
+		zap.Error(err),
+	)
+
+	// Try nearby ports
+	for offset := 1; offset <= 10; offset++ {
+		altPort := preferredPort + offset
+		altAddr := fmt.Sprintf("localhost:%d", altPort)
+		listener, err = net.Listen("tcp", altAddr)
+		if err == nil {
+			return listener, altPort, nil
+		}
+	}
+
+	// Last resort: OS-assigned port
+	listener, err = net.Listen("tcp", "localhost:0")
+	if err != nil {
+		return nil, 0, fmt.Errorf("could not bind to any port: %w", err)
+	}
+	actualPort := listener.Addr().(*net.TCPAddr).Port
+	return listener, actualPort, nil
+}
+
+// saveConfig saves the device token back to the YAML config file.
 func saveConfig(path string, cfg *config.Config) error {
-	// Read the file
+	return saveConfigField(path, "device_token:", fmt.Sprintf("  device_token: \"%s\"", cfg.Auth.DeviceToken))
+}
+
+// saveConfigField does a line-level find-and-replace in the config YAML.
+// It finds the first line whose trimmed content starts with fieldPrefix
+// and replaces the entire line with newLine.
+func saveConfigField(path string, fieldPrefix, newLine string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("failed to read config file: %w", err)
 	}
 
-	// Simple string replacement for device_token
-	content := string(data)
-	
-	// Find and replace device_token line
-	lines := strings.Split(content, "\n")
+	lines := strings.Split(string(data), "\n")
 	found := false
 	for i, line := range lines {
-		if strings.HasPrefix(strings.TrimSpace(line), "device_token:") {
-			lines[i] = fmt.Sprintf("  device_token: \"%s\"", cfg.Auth.DeviceToken)
+		if strings.HasPrefix(strings.TrimSpace(line), fieldPrefix) {
+			lines[i] = newLine
 			found = true
 			break
 		}
 	}
-	
-	if !found {
-		// Find the auth section and add device_token
-		for i, line := range lines {
-			if strings.TrimSpace(line) == "auth:" {
-				// Insert device_token after auth:
-				lines = append(lines[:i+1], append([]string{fmt.Sprintf("  device_token: \"%s\"", cfg.Auth.DeviceToken)}, lines[i+1:]...)...)
-				found = true
-				break
-			}
-		}
-	}
 
 	if !found {
-		return fmt.Errorf("could not find auth section in config file")
+		return fmt.Errorf("field %q not found in config file", fieldPrefix)
 	}
 
-	// Write back
 	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}

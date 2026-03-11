@@ -28,6 +28,7 @@ type TrackingService struct {
 	
 	currentState     tracker.ActivityState
 	stopped          bool
+	isPaused         bool
 	mu               sync.RWMutex
 	appSequenceCounter int // Sequence counter for app focus events
 	
@@ -138,6 +139,16 @@ func (ts *TrackingService) Stop() {
 
 // onAppFocus handles app focus change events from window tracker
 func (ts *TrackingService) onAppFocus(appFocus *tracker.AppFocusInfo) {
+	ts.mu.RLock()
+	isPaused := ts.isPaused
+	ts.mu.RUnlock()
+
+	// Skip processing if paused
+	if isPaused {
+		ts.logger.Debug("Skipping app focus event - tracking is paused")
+		return
+	}
+
 	ts.mu.Lock()
 	sequence := ts.appSequenceCounter
 	ts.appSequenceCounter++
@@ -189,9 +200,16 @@ func (ts *TrackingService) onActivityStateChange(state tracker.ActivityState) {
 func (ts *TrackingService) OnSessionEnd(session *ActiveSession) {
 	ts.mu.RLock()
 	stopped := ts.stopped
+	isPaused := ts.isPaused
 	ts.mu.RUnlock()
 	
-	if stopped {
+	if stopped || isPaused {
+		if isPaused {
+			ts.logger.Debug("Skipping session end - tracking is paused",
+				zap.String("source", session.Source),
+				zap.String("application", session.Application),
+			)
+		}
 		return
 	}
 
@@ -403,6 +421,26 @@ func (ts *TrackingService) processQueue() {
 			zap.Int("event_count", len(events)),
 		)
 	}
+}
+
+// SetPaused sets the pause state of tracking
+func (ts *TrackingService) SetPaused(paused bool) {
+	ts.mu.Lock()
+	ts.isPaused = paused
+	ts.mu.Unlock()
+	
+	if paused {
+		ts.logger.Info("Tracking paused")
+	} else {
+		ts.logger.Info("Tracking resumed")
+	}
+}
+
+// IsPaused returns whether tracking is currently paused
+func (ts *TrackingService) IsPaused() bool {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	return ts.isPaused
 }
 
 // GetStatus returns the current tracking status

@@ -1,0 +1,27 @@
+env: "production"
+storage_path: "storage/database.db"
+http_server:
+  address: "localhost:8082"
+log:
+  level: "info"
+  format: "json"
+backend:
+  base_url: "https://api.desktime.averox.com"
+  api_key: ""
+  timeout: 30
+tracking:
+  window_poll_interval: 2
+  idle_threshold: 300
+  away_threshold: 900
+  batch_size: 100
+  batch_flush_interval: 15
+  session_inactivity_timeout: 60
+device:
+  id: ""  # Auto-generated on first run
+  name: "" # Optional device name
+auth:
+  device_token: ""  # Will be populated after device authorization
+  callback_port: 8080
+server:
+  enabled: true
+  port: 8765

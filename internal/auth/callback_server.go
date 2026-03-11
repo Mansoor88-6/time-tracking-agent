@@ -35,7 +35,7 @@ const (
 		}
 		.success {
 			color: #10b981;
-			font-size: 2rem;
+			font-size: 3rem;
 			margin-bottom: 1rem;
 		}
 		h1 {
@@ -50,7 +50,7 @@ const (
 </head>
 <body>
 	<div class="container">
-		<div class="success">✓</div>
+		<div class="success">&#10003;</div>
 		<h1>Device Registered Successfully!</h1>
 		<p>Your device has been registered and authorized.</p>
 		<p>You can close this window.</p>
@@ -82,7 +82,7 @@ const (
 		}
 		.error {
 			color: #ef4444;
-			font-size: 2rem;
+			font-size: 3rem;
 			margin-bottom: 1rem;
 		}
 		h1 {
@@ -97,7 +97,7 @@ const (
 </head>
 <body>
 	<div class="container">
-		<div class="error">✗</div>
+		<div class="error">&#10007;</div>
 		<h1>Registration Failed</h1>
 		<p>%s</p>
 		<p>Please try again.</p>
@@ -113,37 +113,45 @@ type CallbackServer struct {
 	errChan  chan error
 	logger   *zap.Logger
 	port     int
+	// ActualPort is the port the server actually bound to (may differ from
+	// the requested port if that port was busy).
+	ActualPort int
 }
 
-// NewCallbackServer creates a new callback server
-func NewCallbackServer(port int, logger *zap.Logger) *CallbackServer {
+// NewCallbackServer creates a new callback server.
+// preferredPort is tried first; if unavailable the OS picks a free port.
+func NewCallbackServer(preferredPort int, logger *zap.Logger) *CallbackServer {
 	return &CallbackServer{
 		codeChan: make(chan string, 1),
 		errChan:  make(chan error, 1),
 		logger:   logger,
-		port:     port,
+		port:     preferredPort,
 	}
 }
 
-// Start starts the callback server and waits for the authorization code
+// Start starts the callback server and waits for the authorization code.
+// It tries the preferred port first, then falls back to an OS-assigned port.
 func (s *CallbackServer) Start(ctx context.Context) (string, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/callback", s.handleCallback)
 
-	addr := fmt.Sprintf("localhost:%d", s.port)
-	listener, err := net.Listen("tcp", addr)
+	// Try preferred port first, then fallback to OS-assigned port
+	listener, actualPort, err := s.listen()
 	if err != nil {
 		return "", fmt.Errorf("failed to start callback server: %w", err)
 	}
+	s.ActualPort = actualPort
 
 	s.server = &http.Server{
-		Addr:    addr,
 		Handler: mux,
 	}
 
 	// Start server in goroutine
 	go func() {
-		s.logger.Info("Callback server started", zap.String("address", addr))
+		s.logger.Info("Callback server started",
+			zap.Int("requested_port", s.port),
+			zap.Int("actual_port", s.ActualPort),
+		)
 		if err := s.server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			s.errChan <- err
 		}
@@ -158,6 +166,42 @@ func (s *CallbackServer) Start(ctx context.Context) (string, error) {
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
+}
+
+// listen tries to bind to the preferred port; if that fails it binds to :0
+// (OS-assigned free port). Returns the listener and the actual port.
+func (s *CallbackServer) listen() (net.Listener, int, error) {
+	// Try preferred port
+	addr := fmt.Sprintf("127.0.0.1:%d", s.port)
+	listener, err := net.Listen("tcp", addr)
+	if err == nil {
+		return listener, s.port, nil
+	}
+
+	s.logger.Warn("Preferred callback port unavailable, trying alternative ports",
+		zap.Int("preferred_port", s.port),
+		zap.Error(err),
+	)
+
+	// Try a small range of nearby ports
+	for offset := 1; offset <= 20; offset++ {
+		altPort := s.port + offset
+		altAddr := fmt.Sprintf("127.0.0.1:%d", altPort)
+		listener, err = net.Listen("tcp", altAddr)
+		if err == nil {
+			s.logger.Info("Using alternative callback port", zap.Int("port", altPort))
+			return listener, altPort, nil
+		}
+	}
+
+	// Last resort: let the OS pick any available port
+	listener, err = net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, 0, fmt.Errorf("could not bind to any port: %w", err)
+	}
+	actualPort := listener.Addr().(*net.TCPAddr).Port
+	s.logger.Info("Using OS-assigned callback port", zap.Int("port", actualPort))
+	return listener, actualPort, nil
 }
 
 // Stop stops the callback server
