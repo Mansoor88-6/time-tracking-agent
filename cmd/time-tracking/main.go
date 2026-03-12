@@ -273,6 +273,13 @@ func main() {
 		log.Info("Browser event server disabled in configuration")
 	}
 
+	// Purge any queued events that are too old for the backend to accept.
+	// The backend rejects events with timestamps older than ~24h, so we drop
+	// them now to avoid flooding the backend with guaranteed-to-fail requests.
+	if err := eventQueue.PurgeExpiredEvents(24 * time.Hour); err != nil {
+		log.Warn("Failed to purge expired queued events", zap.Error(err))
+	}
+
 	// Start tracking service
 	if err := trackingService.Start(); err != nil {
 		log.Fatal("Failed to start tracking service", zap.Error(err))

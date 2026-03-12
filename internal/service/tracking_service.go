@@ -398,6 +398,21 @@ func (ts *TrackingService) processQueue() {
 	// Try to send
 	err = ts.apiClient.SendBatch(ts.deviceID, events)
 	if err != nil {
+		// Check if this is a non-retryable error (Bad Request, Auth failure).
+		// In these cases, the backend will always reject these events, so we
+		// remove them from the queue immediately rather than retrying forever.
+		switch err.(type) {
+		case *client.BadRequestError, *client.AuthError:
+			ts.logger.Warn("Dropping non-retryable queued events (bad request / auth error)",
+				zap.Error(err),
+				zap.Int("event_count", len(events)),
+			)
+			if removeErr := ts.eventQueue.Remove(ids); removeErr != nil {
+				ts.logger.Error("Failed to remove non-retryable events from queue", zap.Error(removeErr))
+			}
+			return
+		}
+
 		ts.logger.Warn("Failed to send queued batch",
 			zap.Error(err),
 			zap.Int("event_count", len(events)),

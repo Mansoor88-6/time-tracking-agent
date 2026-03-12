@@ -199,3 +199,67 @@ func (eq *EventQueue) CleanupOldEvents(olderThan time.Duration) error {
 
 	return nil
 }
+
+// PurgeExpiredEvents removes queued events whose embedded event Timestamp is
+// older than maxAge. The backend will always reject such events, so there is no
+// point retrying them.
+func (eq *EventQueue) PurgeExpiredEvents(maxAge time.Duration) error {
+	rows, err := eq.db.Query(`SELECT id, event_data FROM pending_events`)
+	if err != nil {
+		return fmt.Errorf("failed to query events for expiry check: %w", err)
+	}
+	defer rows.Close()
+
+	cutoffMs := time.Now().Add(-maxAge).UnixMilli()
+	var expiredIDs []interface{}
+
+	for rows.Next() {
+		var id int64
+		var eventData string
+		if err := rows.Scan(&id, &eventData); err != nil {
+			continue
+		}
+
+		// Decode just enough to check the timestamp
+		var partial struct {
+			Timestamp int64 `json:"timestamp"`
+		}
+		if err := json.Unmarshal([]byte(eventData), &partial); err != nil {
+			continue
+		}
+
+		if partial.Timestamp > 0 && partial.Timestamp < cutoffMs {
+			expiredIDs = append(expiredIDs, id)
+		}
+	}
+	rows.Close()
+
+	if len(expiredIDs) == 0 {
+		return nil
+	}
+
+	// Build DELETE query
+	query := "DELETE FROM pending_events WHERE id IN ("
+	for i := range expiredIDs {
+		if i > 0 {
+			query += ","
+		}
+		query += "?"
+	}
+	query += ")"
+
+	result, err := eq.db.Exec(query, expiredIDs...)
+	if err != nil {
+		return fmt.Errorf("failed to purge expired events: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected > 0 {
+		eq.logger.Info("Purged expired queued events (timestamp too old for backend)",
+			zap.Int64("count", rowsAffected),
+			zap.Duration("max_age", maxAge),
+		)
+	}
+
+	return nil
+}
